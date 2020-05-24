@@ -1,0 +1,21 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: Creates a ECR Repository
+Parameters:
+  RepositoryName:
+    Type: String
+    Description: Name of the repository
+Resources:
+  ECRRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Ref RepositoryName
+Outputs:
+  ECRRepositoryUri:
+    Description: The Repository URI
+    Value: !Join
+      - ""
+      - - !Ref AWS::AccountId
+        - ".dkr.ecr."
+        - !Ref AWS::Region
+        - ".amazonaws.com/"
+        - !Ref ECRRepository

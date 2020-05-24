@@ -1,0 +1,163 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: Creates a Fargate ECR Task definition
+Parameters:
+  InfrastructureStack:
+    Type: String
+    Description: Name of the Infrastructure Stack
+  FamilyName:
+    Type: String
+    Description: Name of the Task family
+  Cpu:
+    Type: String
+    Description: The amount of CPU to use in the task
+  Ram:
+    Type: String
+    Description: The amount of memory to use in the task
+  ContainerPort:
+    Type: String
+    Description: The container port
+  ContainerImage:
+    Type: String
+    Description: The container image
+Resources:
+  ExecutionRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ecs-tasks.amazonaws.com
+            Action:
+              - sts:AssumeRole
+  TaskRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ecs-tasks.amazonaws.com
+            Action:
+              - sts:AssumeRole
+  CloudWatchLogsPolicy:
+    Type: "AWS::IAM::Policy"
+    Properties:
+      PolicyName: ECSRoleCloudwatchPolicy
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Action:
+              - logs:*
+            Resource: "*"
+      Roles:
+        - !Ref ExecutionRole
+        - !Ref TaskRole
+  ECRPolicy:
+    Type: "AWS::IAM::Policy"
+    Properties:
+      PolicyName: ECSExecutionRoleECRPolicy
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Action:
+              - ecr:*
+            Resource: "*"
+      Roles:
+        - !Ref ExecutionRole
+  SSMPolicy:
+    Type: "AWS::IAM::Policy"
+    Properties:
+      PolicyName: ECSExecutionRoleSSMPolicy
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Action:
+              - ssm:*
+              - kms:Decrypt
+            Resource: "*"
+      Roles:
+        - !Ref ExecutionRole
+  S3Policy:
+    Type: "AWS::IAM::Policy"
+    Properties:
+      PolicyName: ECSTaskRoleS3Policy
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Action:
+              - s3:*
+            Resource: "*"
+      Roles:
+        - !Ref TaskRole
+  TaskSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: ECS Security Group
+      VpcId:
+        Fn::ImportValue: !Sub "${InfrastructureStack}:VpcId"
+      Tags:
+        - Key: "Name"
+          Value: !Sub "${FamilyName}-task-sg"
+  TaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Cpu: !Ref Cpu
+      ExecutionRoleArn: !GetAtt ExecutionRole.Arn
+      Family: !Ref FamilyName
+      Memory: !Ref Ram
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      TaskRoleArn: !GetAtt TaskRole.Arn
+      ContainerDefinitions:
+        - Image: !Ref ContainerImage
+          Secrets:
+            - Name: PAT
+              ValueFrom: !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/github_runners_pat
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-create-group: true
+              awslogs-group: "/ecs/github-runners"
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: "ecs"
+          Memory: 512
+          MemoryReservation: 512
+          Name: "github-runners"
+          PortMappings:
+            - ContainerPort: !Ref ContainerPort
+  ECSService:
+    Type: AWS::ECS::Service
+    Properties:
+      Cluster:
+        Fn::ImportValue: !Sub "${InfrastructureStack}:ClusterArn"
+      DeploymentConfiguration:
+        MaximumPercent: 200
+        MinimumHealthyPercent: 75
+      DesiredCount: 1
+      LaunchType: "FARGATE"
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          Subnets:
+            - Fn::ImportValue: !Sub "${InfrastructureStack}:PublicSubnetOne"
+            - Fn::ImportValue: !Sub "${InfrastructureStack}:PublicSubnetTwo"
+          AssignPublicIp: ENABLED
+          SecurityGroups:
+            - !Ref TaskSecurityGroup
+      ServiceName: !Ref FamilyName
+      TaskDefinition: !Ref TaskDefinition
+Outputs:
+  TaskArn:
+    Description: The arn for the Task
+    Value: !Ref TaskDefinition
+    Export:
+      Name: !Join [":", [!Ref "AWS::StackName", "TaskDefinitionArn"]]

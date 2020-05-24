@@ -1,0 +1,144 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: Creates infrastructure for ECS cluster
+Parameters:
+  ApplicationName:
+    Type: String
+    Description: The name of the "Application"
+Mappings:
+  SubnetConfig:
+    VPC:
+      CIDR: "10.150.0.0/16"
+    PublicOne:
+      CIDR: "10.150.0.0/24"
+    PublicTwo:
+      CIDR: "10.150.1.0/24"
+
+Resources:
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      CidrBlock: !FindInMap ["SubnetConfig", "VPC", "CIDR"]
+      Tags:
+        - Key: "Name"
+          Value: !Ref ApplicationName
+  PublicSubnetOne:
+    Type: AWS::EC2::Subnet
+    Properties:
+      AvailabilityZone:
+        Fn::Select:
+          - 0
+          - Fn::GetAZs: { Ref: "AWS::Region" }
+      VpcId: !Ref "VPC"
+      CidrBlock: !FindInMap ["SubnetConfig", "PublicOne", "CIDR"]
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: "Name"
+          Value: !Sub "${ApplicationName}-public-one"
+  PublicSubnetTwo:
+    Type: AWS::EC2::Subnet
+    Properties:
+      AvailabilityZone:
+        Fn::Select:
+          - 1
+          - Fn::GetAZs: { Ref: "AWS::Region" }
+      VpcId: !Ref "VPC"
+      CidrBlock: !FindInMap ["SubnetConfig", "PublicTwo", "CIDR"]
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: "Name"
+          Value: !Sub "${ApplicationName}-public-two"
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: "Name"
+          Value: !Sub "${ApplicationName}"
+  GatewayAttachement:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref "VPC"
+      InternetGatewayId: !Ref "InternetGateway"
+  NatGatewayIp:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: "vpc"
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref "VPC"
+      Tags:
+        - Key: "Name"
+          Value: !Sub "${ApplicationName}-public"
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: GatewayAttachement
+    Properties:
+      RouteTableId: !Ref "PublicRouteTable"
+      DestinationCidrBlock: "0.0.0.0/0"
+      GatewayId: !Ref "InternetGateway"
+  PublicSubnetOneRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnetOne
+      RouteTableId: !Ref PublicRouteTable
+  PublicSubnetTwoRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnetTwo
+      RouteTableId: !Ref PublicRouteTable
+  ECSCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Ref "ApplicationName"
+  ECSServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: [ecs.amazonaws.com]
+            Action: ["sts:AssumeRole"]
+      Path: /
+      Policies:
+        - PolicyName: ecs-service
+          PolicyDocument:
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "elasticloadbalancing:DeregisterInstancesFromLoadBalancer"
+                  - "elasticloadbalancing:DeregisterTargets"
+                  - "elasticloadbalancing:Describe*"
+                  - "elasticloadbalancing:RegisterInstancesWithLoadBalancer"
+                  - "elasticloadbalancing:RegisterTargets"
+                  - "ec2:Describe*"
+                  - "ec2:AuthorizeSecurityGroupIngress"
+                Resource: "*"
+Outputs:
+  ClusterName:
+    Description: The name of the ECS cluster, used to deploy services
+    Value: !Ref "ECSCluster"
+    Export:
+      Name: !Join [":", [!Ref "AWS::StackName", "ClusterName"]]
+  ClusterArn:
+    Description: The name of the ECS cluster, used to deploy services
+    Value: !GetAtt "ECSCluster.Arn"
+    Export:
+      Name: !Join [":", [!Ref "AWS::StackName", "ClusterArn"]]
+  VpcId:
+    Description: The ID of the VPC
+    Value: !Ref "VPC"
+    Export:
+      Name: !Join [":", [!Ref "AWS::StackName", "VpcId"]]
+  PublicSubnetOne:
+    Description: Public subnet one
+    Value: !Ref "PublicSubnetOne"
+    Export:
+      Name: !Join [":", [!Ref "AWS::StackName", "PublicSubnetOne"]]
+  PublicSubnetTwo:
+    Description: Public subnet two
+    Value: !Ref "PublicSubnetTwo"
+    Export:
+      Name: !Join [":", [!Ref "AWS::StackName", "PublicSubnetTwo"]]
