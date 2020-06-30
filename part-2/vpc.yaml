@@ -1,0 +1,97 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: Creates a basic VPC
+Parameters:
+  ProjectName:
+    Type: String
+    Description: The name of the project.
+  IPSuperSet:
+    Type: String
+    Description: The IP superset that will be use to construct the VPC CIDR, e.g 10.150
+
+Resources:
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      CidrBlock: !Sub "${IPSuperSet}.0.0/16"
+      Tags:
+        - Key: "Name"
+          Value: !Ref ProjectName
+  PublicSubnetOne:
+    Type: AWS::EC2::Subnet
+    Properties:
+      AvailabilityZone:
+        Fn::Select:
+          - 0
+          - Fn::GetAZs: { Ref: "AWS::Region" }
+      VpcId: !Ref "VPC"
+      CidrBlock: !Sub "${IPSuperSet}.0.0/24"
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: "Name"
+          Value: !Sub "${ProjectName}-public-one"
+  PublicSubnetTwo:
+    Type: AWS::EC2::Subnet
+    Properties:
+      AvailabilityZone:
+        Fn::Select:
+          - 1
+          - Fn::GetAZs: { Ref: "AWS::Region" }
+      VpcId: !Ref "VPC"
+      CidrBlock: !Sub "${IPSuperSet}.1.0/24"
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: "Name"
+          Value: !Sub "${ProjectName}-public-two"
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: "Name"
+          Value: !Sub "${ProjectName}"
+  GatewayAttachement:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref "VPC"
+      InternetGatewayId: !Ref "InternetGateway"
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref "VPC"
+      Tags:
+        - Key: "Name"
+          Value: !Sub "${ProjectName}-public"
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: GatewayAttachement
+    Properties:
+      RouteTableId: !Ref "PublicRouteTable"
+      DestinationCidrBlock: "0.0.0.0/0"
+      GatewayId: !Ref "InternetGateway"
+  PublicSubnetOneRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnetOne
+      RouteTableId: !Ref PublicRouteTable
+  PublicSubnetTwoRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnetTwo
+      RouteTableId: !Ref PublicRouteTable
+Outputs:
+  VpcId:
+    Description: The ID of the VPC
+    Value: !Ref "VPC"
+    Export:
+      Name: !Join [":", [!Ref "AWS::StackName", "VpcId"]]
+  PublicSubnetOne:
+    Description: Public subnet one
+    Value: !Ref "PublicSubnetOne"
+    Export:
+      Name: !Join [":", [!Ref "AWS::StackName", "PublicSubnet1"]]
+  PublicSubnetTwo:
+    Description: Public subnet two
+    Value: !Ref "PublicSubnetTwo"
+    Export:
+      Name: !Join [":", [!Ref "AWS::StackName", "PublicSubnet2"]]

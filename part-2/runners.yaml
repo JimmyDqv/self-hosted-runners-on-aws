@@ -1,0 +1,219 @@
+AWSTemplateFormatVersion: 2010-09-09
+Transform: "AWS::Serverless-2016-10-31"
+Description: Creates the infrastructure for the GitHub Runners
+Parameters:
+  ProjectName:
+    Type: String
+    Description: The name of the project.
+  VpcStackName:
+    Type: String
+    Description: The name of the VPC stack
+  SSHKeyName:
+    Type: String
+    Description: Name of the ssh key.
+  EC2ImageId:
+    Type: String
+    Description: Id of the EC2 AMI.
+
+Resources:
+  SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: EC2 Security Group
+      VpcId:
+        Fn::ImportValue: !Sub ${VpcStackName}:VpcId
+      Tags:
+        - Key: "Name"
+          Value: !Sub ${ProjectName}-ec2-sg
+
+  SecurityGroupInboundAllowSelf:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref SecurityGroup
+      IpProtocol: tcp
+      FromPort: "0"
+      ToPort: "65535"
+      SourceSecurityGroupId: !Ref SecurityGroup
+
+  InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonEC2RoleforSSM
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ec2.amazonaws.com
+            Action: sts:AssumeRole
+
+  EC2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref InstanceRole
+
+  AutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      AutoScalingGroupName: !Sub ${ProjectName}-asg
+      Cooldown: 300
+      DesiredCapacity: 0
+      MaxSize: 5
+      MinSize: 0
+      HealthCheckGracePeriod: 300
+      HealthCheckType: EC2
+      LaunchConfigurationName: !Ref LaunchConfiguration
+      VPCZoneIdentifier:
+        - Fn::ImportValue: !Sub ${VpcStackName}:PublicSubnet1
+        - Fn::ImportValue: !Sub ${VpcStackName}:PublicSubnet2
+      Tags:
+        - Key: "Name"
+          Value: !Sub ${ProjectName}
+          PropagateAtLaunch: "true"
+
+  LaunchConfiguration:
+    Type: AWS::AutoScaling::LaunchConfiguration
+    Properties:
+      ImageId: !Ref EC2ImageId
+      InstanceType: t3.micro
+      IamInstanceProfile: !GetAtt EC2InstanceProfile.Arn
+      KeyName: !Ref SSHKeyName
+      SecurityGroups:
+        - !Ref SecurityGroup
+      UserData:
+        Fn::Base64:
+          Fn::Sub: |
+            #!/bin/bash -xe
+            yum update -y
+            yum install docker -y
+            yum install git -y
+            yum install jq -y 
+            sudo usermod -a -G docker ec2-user
+            sudo systemctl start docker
+            sudo systemctl enable docker
+            export RUNNER_ALLOW_RUNASROOT=true
+            mkdir actions-runner
+            cd actions-runner
+            curl -O -L https://github.com/actions/runner/releases/download/v2.262.1/actions-runner-linux-x64-2.262.1.tar.gz
+            tar xzf ./actions-runner-linux-x64-2.262.1.tar.gz
+            PAT=<Super Secret PAT>
+            token=$(curl -s -XPOST \
+                -H "authorization: token $PAT" \
+                https://api.github.com/repos/<GitHub_User>/<GitHub_Repo>/actions/runners/registration-token |\
+                jq -r .token)
+            sudo chown ec2-user -R /actions-runner
+            ./config.sh --url https://github.com/<GitHub_User>/<GitHub_Repo> --token $token --name "my-runners-$(hostname)" --work _work
+            sudo ./svc.sh install
+            sudo ./svc.sh start
+            sudo chown ec2-user -R /actions-runner
+
+  TerminateLifecycleHook:
+    Type: AWS::AutoScaling::LifecycleHook
+    Properties:
+      AutoScalingGroupName: !Ref AutoScalingGroup
+      LifecycleTransition: autoscaling:EC2_INSTANCE_TERMINATING
+
+  CloudWatchLogsPolicy:
+    Type: "AWS::IAM::Policy"
+    Properties:
+      PolicyName: amvCloudWatchPolicy
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Action:
+              - logs:*
+            Resource: "arn:aws:logs:*:*:*"
+      Roles:
+        - !Ref LifeCycleHookTerminatingFunctionRole
+
+  LifeCycleHookTerminatingFunctionRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMFullAccess
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+
+  LifeCycleHookTerminatingFunctionPolicy:
+    Type: "AWS::IAM::Policy"
+    Properties:
+      PolicyName: terminateFunctionPolicy
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Action:
+              - autoscaling:CompleteLifecycleAction
+            Resource: "*"
+      Roles:
+        - !Ref LifeCycleHookTerminatingFunctionRole
+
+  LifeCycleHookTerminatingFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: github-runners-asg-lifecycle-hook-terminate
+      Runtime: python3.6
+      MemorySize: 256
+      Timeout: 30
+      CodeUri: ./lambdas
+      Handler: terminate.handler
+      Role: !GetAtt LifeCycleHookTerminatingFunctionRole.Arn
+      Environment:
+        Variables:
+          SSM_DOCUMENT_NAME: !Ref RemoveDocument
+
+  RemoveDocument:
+    Type: AWS::SSM::Document
+    Properties:
+      DocumentType: Command
+      Tags:
+        - Key: Name
+          Value: github-actions-install-register-runner
+      Content:
+        schemaVersion: "2.2"
+        description: Command Document de-register GitHub Actions Runner
+        mainSteps:
+          - action: "aws:runShellScript"
+            name: "deregister"
+            inputs:
+              runCommand:
+                - "cd /actions-runner"
+                - "sudo ./svc.sh stop"
+                - "sudo ./svc.sh uninstall"
+                - "PAT=<Super Secret PAT>"
+                - 'token=$(curl -s -XPOST -H "authorization: token $PAT" https://api.github.com/repos/<GitHub_User>/<GitHub_Repo>/actions/runners/remove-token | jq -r .token)'
+                - 'su ec2-user -c "./config.sh remove --token $token"'
+
+  Permission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !GetAtt LifeCycleHookTerminatingFunction.Arn
+      Principal: events.amazonaws.com
+
+  TerminatingRule:
+    Type: AWS::Events::Rule
+    Properties:
+      EventPattern: !Sub |
+        {
+          "source": [
+            "aws.autoscaling"
+          ],
+          "detail-type": [
+            "EC2 Instance-terminate Lifecycle Action"
+          ]
+        }
+      Targets:
+        - Arn: !GetAtt LifeCycleHookTerminatingFunction.Arn
+          Id: target
