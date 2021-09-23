@@ -1,0 +1,119 @@
+{
+    "Comment": "AutoScale number of GitHub Runners",
+    "StartAt": "Check Cool Down",
+    "States": {
+        "Check Cool Down": {
+            "Type": "Task",
+            "Resource": "${CheckCoolDownArn}",
+            "ResultPath": "$.output.AutoScaling.CoolDown",
+            "OutputPath": "$.output",
+            "Next": "Carry On?"
+        },
+        "Carry On?": {
+            "Type": "Choice",
+            "Choices": [
+                {
+                    "Variable": "$.AutoScaling.CoolDown",
+                    "StringEquals": "CARRY_ON",
+                    "Next": "Get Runner Count"
+                },
+                {
+                    "Variable": "$.AutoScaling.CoolDown",
+                    "StringEquals": "BREAK",
+                    "Next": "No Scaling Needed"
+                }
+            ],
+            "Default": "Get Runner Count"
+        },
+        "Get Runner Count": {
+            "Type": "Task",
+            "Resource": "${GetRunnerCountArn}",
+            "ResultPath": "$.AutoScaling.RunnerCount",
+            "Retry": [
+                {
+                    "ErrorEquals": [
+                        "States.TaskFailed"
+                    ],
+                    "IntervalSeconds": 2,
+                    "MaxAttempts": 3,
+                    "BackoffRate": 1
+                }
+            ],
+            "Next": "Get Queued Runs Count"
+        },
+        "Get Queued Runs Count": {
+            "Type": "Task",
+            "Resource": "${GetQueuedRunCountArn}",
+            "ResultPath": "$.AutoScaling.QueuedRunsCount",
+            "Retry": [
+                {
+                    "ErrorEquals": [
+                        "States.TaskFailed"
+                    ],
+                    "IntervalSeconds": 2,
+                    "MaxAttempts": 3,
+                    "BackoffRate": 1
+                }
+            ],
+            "Next": "Determine Scaling Action Needed"
+        },
+        "Determine Scaling Action Needed": {
+            "Type": "Task",
+            "Resource": "${DetermineScalingActionArn}",
+            "ResultPath": "$.AutoScaling.Action",
+            "Retry": [
+                {
+                    "ErrorEquals": [
+                        "States.TaskFailed"
+                    ],
+                    "IntervalSeconds": 2,
+                    "MaxAttempts": 3,
+                    "BackoffRate": 1
+                }
+            ],
+            "Next": "Scaling?"
+        },
+        "Scaling?": {
+            "Type": "Choice",
+            "Choices": [
+                {
+                    "Variable": "$.AutoScaling.Action",
+                    "StringEquals": "scale_in",
+                    "Next": "Find Idle Runner"
+                },
+                {
+                    "Variable": "$.AutoScaling.Action",
+                    "StringEquals": "scale_out",
+                    "Next": "Scale Out"
+                }
+            ],
+            "Default": "No Scaling Needed"
+        },
+        "Find Idle Runner": {
+            "Type": "Task",
+            "Resource": "${FindIdleRunnerArn}",
+            "ResultPath": "$.AutoScaling.Runner",
+            "Next": "Scale In"
+        },
+        "Scale In": {
+            "Type": "Task",
+            "Resource": "${ScaleInRunnerArn}",
+            "ResultPath": "$.LambdaResult",
+            "Next": "End AutoScaling"
+        },
+        "Scale Out": {
+            "Type": "Task",
+            "Resource": "${ScaleOutRunnerArn}",
+            "ResultPath": "$.EC2Action",
+            "Next": "End AutoScaling"
+        },
+        "No Scaling Needed": {
+            "Type": "Pass",
+            "Next": "End AutoScaling"
+        },
+        "End AutoScaling": {
+            "Type": "Pass",
+            "End": true
+        }
+    }
+}

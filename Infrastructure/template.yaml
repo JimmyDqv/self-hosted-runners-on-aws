@@ -1,0 +1,354 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: Infrastructure needed for GitHub Self Hosted Runners
+
+Parameters:
+  GitHubSecret:
+    Type: String
+    Description: The GitHub Secret used for signature check.
+  IPSuperSet:
+    Type: String
+    Description: The IP Superset to use for the VPC CIDR range, e.g 10.0
+    Default: "10.0"
+  SetupPrivateSubnets:
+    Type: String
+    Description: Indicate if both public and private subnets should be created
+    Default: false
+    AllowedValues:
+      - true
+      - false
+
+Conditions:
+  DeployPrivateSubnets: !Equals [!Ref SetupPrivateSubnets, true]
+
+Resources:
+  ##########################################################################
+  #  EventBus                                                              #
+  ##########################################################################
+  EventBridge:
+    Type: AWS::Events::EventBus
+    Properties:
+      Name: github-webhook
+
+  ##########################################################################
+  #  WebHook HTTP                                                          #
+  ##########################################################################
+  GitHubWebHookHttpApi:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      DefinitionBody:
+        "Fn::Transform":
+          Name: "AWS::Include"
+          Parameters:
+            Location: "./api.yaml"
+      Auth:
+        DefaultAuthorizer: LambdaAuthorizer
+        Authorizers:
+          LambdaAuthorizer:
+            FunctionArn: !GetAtt AuthFunction.Arn
+            FunctionInvokeRole: !GetAtt InvokeAuthFunctionRole.Arn
+            Identity:
+              Headers:
+                - X-Hub-Signature
+            AuthorizerPayloadFormatVersion: 2.0
+            EnableSimpleResponses: true
+
+  WebhookHttpApiRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Principal:
+              Service: "apigateway.amazonaws.com"
+            Action:
+              - "sts:AssumeRole"
+      Policies:
+        - PolicyName: ApiDirectWriteEventBridge
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              Action:
+                - events:PutEvents
+              Effect: Allow
+              Resource:
+                - !Sub arn:aws:events:${AWS::Region}:${AWS::AccountId}:event-bus/${EventBridge}
+
+  ##########################################################################
+  #  HTTP API Auth Lambda                                                  #
+  ##########################################################################
+  AuthFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Timeout: 15
+      Runtime: python3.7
+      MemorySize: 512
+      CodeUri: AuthLambda
+      Handler: auth.handler
+      Policies:
+        - SSMParameterReadPolicy:
+            ParameterName: !Ref GitHubSecret
+      Environment:
+        Variables:
+          GITHUB_SECRET: !Sub /${GitHubSecret}
+
+  InvokeAuthFunctionRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Principal:
+              Service: "apigateway.amazonaws.com"
+            Action:
+              - "sts:AssumeRole"
+      Policies:
+        - PolicyName: InvokeAuthLambda
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              Action:
+                - lambda:InvokeFunction
+              Effect: Allow
+              Resource:
+                - !GetAtt AuthFunction.Arn
+
+  ##########################################################################
+  #  VPC Base Infrastructure                                               #
+  ##########################################################################
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      CidrBlock: !Sub "${IPSuperSet}.0.0/16"
+      Tags:
+        - Key: Name
+          Value: github-runners
+
+  PublicSubnetOne:
+    Type: AWS::EC2::Subnet
+    Properties:
+      AvailabilityZone:
+        Fn::Select:
+          - 0
+          - Fn::GetAZs: { Ref: "AWS::Region" }
+      VpcId: !Ref VPC
+      CidrBlock: !Sub ${IPSuperSet}.0.0/24
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub github-runners-public-one
+
+  PublicSubnetTwo:
+    Type: AWS::EC2::Subnet
+    Properties:
+      AvailabilityZone:
+        Fn::Select:
+          - 1
+          - Fn::GetAZs: { Ref: "AWS::Region" }
+      VpcId: !Ref VPC
+      CidrBlock: !Sub ${IPSuperSet}.1.0/24
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: github-runners-public-two
+
+  PrivateSubnetOne:
+    Type: AWS::EC2::Subnet
+    Condition: DeployPrivateSubnets
+    Properties:
+      AvailabilityZone:
+        Fn::Select:
+          - 0
+          - Fn::GetAZs: { Ref: "AWS::Region" }
+      VpcId: !Ref VPC
+      CidrBlock: !Sub ${IPSuperSet}.2.0/24
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub github-runners-private-one
+
+  PrivateSubnetTwo:
+    Type: AWS::EC2::Subnet
+    Condition: DeployPrivateSubnets
+    Properties:
+      AvailabilityZone:
+        Fn::Select:
+          - 1
+          - Fn::GetAZs: { Ref: "AWS::Region" }
+      VpcId: !Ref VPC
+      CidrBlock: !Sub ${IPSuperSet}.3.0/24
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub github-runners-private-two
+
+  ##########################################################################
+  #  Gateways                                                              #
+  ##########################################################################
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: github-runners
+
+  GatewayAttachement:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  NatGatewayIpOne:
+    Type: AWS::EC2::EIP
+    Condition: DeployPrivateSubnets
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value: github-runners-natgateway-one
+
+  NatGatewayOne:
+    Type: AWS::EC2::NatGateway
+    Condition: DeployPrivateSubnets
+    Properties:
+      AllocationId: !GetAtt NatGatewayIpOne.AllocationId
+      SubnetId: !Ref PublicSubnetOne
+
+  NatGatewayIpTwo:
+    Type: AWS::EC2::EIP
+    Condition: DeployPrivateSubnets
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value: github-runners-natgateway-two
+
+  NatGatewayTwo:
+    Type: AWS::EC2::NatGateway
+    Condition: DeployPrivateSubnets
+    Properties:
+      AllocationId: !GetAtt NatGatewayIpTwo.AllocationId
+      SubnetId: !Ref PublicSubnetTwo
+      Tags:
+        - Key: Name
+          Value: github-runners-natgateway-two
+
+  ##########################################################################
+  #  Route Tables & Routes                                                 #
+  ##########################################################################
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: github-runners-public-rt
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: GatewayAttachement
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnetOneRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnetOne
+      RouteTableId: !Ref PublicRouteTable
+
+  PublicSubnetTwoRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnetTwo
+      RouteTableId: !Ref PublicRouteTable
+
+  PrivateRouteTableOne:
+    Type: AWS::EC2::RouteTable
+    Condition: DeployPrivateSubnets
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: github-runners-private-rt-one
+
+  PrivateRouteOne:
+    Type: AWS::EC2::Route
+    Condition: DeployPrivateSubnets
+    DependsOn: NatGatewayOne
+    Properties:
+      RouteTableId: !Ref PrivateRouteTableOne
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGatewayOne
+
+  PrivateSubnetOneRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Condition: DeployPrivateSubnets
+    Properties:
+      SubnetId: !Ref PrivateSubnetOne
+      RouteTableId: !Ref PrivateRouteTableOne
+
+  PrivateRouteTableTwo:
+    Type: AWS::EC2::RouteTable
+    Condition: DeployPrivateSubnets
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: github-runners-private-rt-two
+
+  PrivateRouteTwo:
+    Type: AWS::EC2::Route
+    Condition: DeployPrivateSubnets
+    DependsOn: NatGatewayTwo
+    Properties:
+      RouteTableId: !Ref PrivateRouteTableTwo
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGatewayTwo
+
+  PrivateSubnetTwoRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Condition: DeployPrivateSubnets
+    Properties:
+      SubnetId: !Ref PrivateSubnetTwo
+      RouteTableId: !Ref PrivateRouteTableTwo
+
+##########################################################################
+#  Outputs                                                               #
+##########################################################################
+Outputs:
+  ApiEndpoint:
+    Description: HTTP API endpoint URL
+    Value: !Sub https://${GitHubWebHookHttpApi}.execute-api.${AWS::Region}.amazonaws.com
+  EventBridge:
+    Description: EventBridge Name
+    Value: !GetAtt EventBridge.Name
+    Export:
+      Name: !Sub ${AWS::StackName}:EventBridgeName
+  AuthFunctionArn:
+    Description: ARN of the Auth function used by API Gateway.
+    Value: !GetAtt AuthFunction.Arn
+  VpcId:
+    Description: The ID of the VPC
+    Value: !Ref VPC
+    Export:
+      Name: !Sub ${AWS::StackName}:VpcId
+  RunnerSubnetOne:
+    Description: The ID for runners subnet one
+    Value:
+      Fn::If:
+        [DeployPrivateSubnets, !Ref PrivateSubnetOne, !Ref PublicSubnetOne]
+    Export:
+      Name: !Sub ${AWS::StackName}:RunnerSubnetOne
+  RunnerSubnetTwo:
+    Description: The ID for private subnet two
+    Value:
+      Fn::If:
+        [DeployPrivateSubnets, !Ref PrivateSubnetTwo, !Ref PublicSubnetTwo]
+    Export:
+      Name: !Sub ${AWS::StackName}:RunnerSubnetTwo

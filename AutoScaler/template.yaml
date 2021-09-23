@@ -1,0 +1,212 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: Auto Scaling GitHub Runners
+
+Globals:
+  Function:
+    Handler: handler.handler
+    Timeout: 120
+    Runtime: python3.7
+    MemorySize: 256
+    Environment:
+      Variables:
+        GITHUB_SECRET: !Sub "/${GitHubSecretPath}"
+        REPO_NAME: "<Add you Repo here>"
+        REPO_OWNER: "<Add repo Owner here>"
+
+Parameters:
+  Application:
+    Type: String
+    Description: Name of Application / Service that own the resources
+  InfrastructureStackName:
+    Type: String
+    Description: The name of the stack with the Base Infrastructure resources, such as VPC
+  RunnersInfrastructureStackName:
+    Type: String
+    Description: The name of the stack with the runners infrastructure, such as the AutoSclingGroup
+  GitHubSecretPath:
+    Type: String
+    Description: Path to the SSM Parameters for GitHub
+
+Resources:
+  ##########################################################################
+  #  Setting Table                                                         #
+  ##########################################################################
+  DynamoDbTSettingsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: GitHubRunnersSettings
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: PK
+          AttributeType: S
+        - AttributeName: SK
+          AttributeType: S
+      KeySchema:
+        - AttributeName: PK
+          KeyType: HASH
+        - AttributeName: SK
+          KeyType: RANGE
+
+  ##########################################################################
+  #  Lambda functions                                                      #
+  ##########################################################################
+  GetRunnerCountFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: lambdas/get-runner-count/
+      Policies:
+        - SSMParameterReadPolicy:
+            ParameterName: !Ref GitHubSecretPath
+
+  GetQueuedRunCountFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: lambdas/get-queued-run-count/
+      Policies:
+        - SSMParameterReadPolicy:
+            ParameterName: !Ref GitHubSecretPath
+
+  FindIdleRunnerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: lambdas/find-idle-runner/
+      Policies:
+        - EC2DescribePolicy: {}
+        - SSMParameterReadPolicy:
+            ParameterName: !Ref GitHubSecretPath
+
+  CheckCoolDownFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: lambdas/check-cool-down/
+      Environment:
+        Variables:
+          SETTINGS_TABLE: !Ref DynamoDbTSettingsTable
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref DynamoDbTSettingsTable
+
+  DetermineScalingActionFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: lambdas/determine-scaling/
+      Environment:
+        Variables:
+          SETTINGS_TABLE: !Ref DynamoDbTSettingsTable
+          ASG:
+            Fn::ImportValue: !Sub "${RunnersInfrastructureStackName}:AutoScalingGroup"
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref DynamoDbTSettingsTable
+        - SSMParameterReadPolicy:
+            ParameterName: !Ref GitHubSecretPath
+        - Version: 2012-10-17
+          Statement:
+            - Effect: Allow
+              Action:
+                - autoscaling:*
+              Resource: "*"
+
+  ScaleInRunnerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: lambdas/scale-in/
+      Environment:
+        Variables:
+          ASG:
+            Fn::ImportValue: !Sub "${RunnersInfrastructureStackName}:AutoScalingGroup"
+          REMOVE_DOCUMENT_NAME:
+            Fn::ImportValue: !Sub "${RunnersInfrastructureStackName}:RemoveRunnerSSMDocument"
+          SETTINGS_TABLE: !Ref DynamoDbTSettingsTable
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref DynamoDbTSettingsTable
+        - Version: 2012-10-17
+          Statement:
+            - Effect: Allow
+              Action:
+                - autoscaling:*
+              Resource: "*"
+        - Version: 2012-10-17
+          Statement:
+            - Effect: Allow
+              Action:
+                - ssm:SendCommand
+                - ssm:ListCommandInvocations
+              Resource: "*"
+        - Version: 2012-10-17
+          Statement:
+            - Effect: Allow
+              Action:
+                - ec2:TerminateInstances
+              Resource: "*"
+
+  ScaleOutRunnerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: lambdas/scale-out/
+      Environment:
+        Variables:
+          ASG:
+            Fn::ImportValue: !Sub "${RunnersInfrastructureStackName}:AutoScalingGroup"
+          SETTINGS_TABLE: !Ref DynamoDbTSettingsTable
+      Policies:
+        - Version: 2012-10-17
+          Statement:
+            - Effect: Allow
+              Action:
+                - autoscaling:*
+              Resource: "*" # Must be * resource level permissions not supported.
+        - DynamoDBCrudPolicy:
+            TableName: !Ref DynamoDbTSettingsTable
+
+  ##########################################################################
+  #   Auto Scaling State Machine                                           #
+  ##########################################################################
+  AutoScalingStateMachineExpress:
+    Type: AWS::Serverless::StateMachine
+    Properties:
+      DefinitionUri: statemachine/statemachine-autoscale.asl.json
+      Tracing:
+        Enabled: true
+      DefinitionSubstitutions:
+        CheckCoolDownArn: !GetAtt CheckCoolDownFunction.Arn
+        GetRunnerCountArn: !GetAtt GetRunnerCountFunction.Arn
+        GetQueuedRunCountArn: !GetAtt GetQueuedRunCountFunction.Arn
+        DetermineScalingActionArn: !GetAtt DetermineScalingActionFunction.Arn
+        ScaleInRunnerArn: !GetAtt ScaleInRunnerFunction.Arn
+        ScaleOutRunnerArn: !GetAtt ScaleOutRunnerFunction.Arn
+        FindIdleRunnerArn: !GetAtt FindIdleRunnerFunction.Arn
+      Policies:
+        - LambdaInvokePolicy:
+            FunctionName: !Ref GetRunnerCountFunction
+        - LambdaInvokePolicy:
+            FunctionName: !Ref GetQueuedRunCountFunction
+        - LambdaInvokePolicy:
+            FunctionName: !Ref DetermineScalingActionFunction
+        - LambdaInvokePolicy:
+            FunctionName: !Ref ScaleInRunnerFunction
+        - LambdaInvokePolicy:
+            FunctionName: !Ref ScaleOutRunnerFunction
+        - LambdaInvokePolicy:
+            FunctionName: !Ref FindIdleRunnerFunction
+        - LambdaInvokePolicy:
+            FunctionName: !Ref CheckCoolDownFunction
+      Events:
+        GitHubWebHook:
+          Type: EventBridgeRule
+          Properties:
+            EventBusName:
+              Fn::ImportValue: !Sub ${InfrastructureStackName}:EventBridgeName
+            Pattern:
+              source:
+                - GitHub-WebHook
+              account:
+                - !Sub ${AWS::AccountId}
+        Periodically:
+          Type: Schedule
+          Properties:
+            Schedule: "rate(15 minutes)"
+            Enabled: true
+      Type: EXPRESS

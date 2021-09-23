@@ -1,0 +1,23 @@
+openapi: "3.0.1"
+info:
+  title: "GitHub WebHook API"
+paths:
+  /webhook:
+    post:
+      responses:
+        default:
+          description: "GitHub WebHook to EventBridge"
+      x-amazon-apigateway-integration:
+        integrationSubtype: "EventBridge-PutEvents"
+        credentials:
+          Fn::GetAtt: [WebhookHttpApiRole, Arn]
+        requestParameters:
+          Detail: "$request.body"
+          DetailType: GitHubWebHook
+          Source: GitHub-WebHook
+          EventBusName:
+            Fn::GetAtt: [EventBridge, Name]
+        payloadFormatVersion: "1.0"
+        type: "aws_proxy"
+        connectionType: "INTERNET"
+x-amazon-apigateway-importexport-version: "1.0"
